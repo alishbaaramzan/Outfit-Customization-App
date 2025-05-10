@@ -39,13 +39,37 @@ def handle_click(event):
         st.session_state['last_point'] = [x, y]
         st.rerun()
 
-# Install required packages when the app starts
+# Check for required packages when the app starts
 @st.cache_resource
-def install_dependencies():
-    import subprocess
-    with st.spinner("Installing dependencies (this may take a minute)..."):
-        subprocess.check_call(["pip", "install", "diffusers", "transformers"])
-    return True
+def check_dependencies():
+    try:
+        import importlib.util
+        
+        # Define required packages
+        required_packages = ["diffusers", "transformers", "torch", "torchvision"]
+        missing_packages = []
+        
+        # Check for each package
+        for package in required_packages:
+            if importlib.util.find_spec(package) is None:
+                missing_packages.append(package)
+        
+        # Install missing packages if needed
+        if missing_packages:
+            import subprocess
+            with st.spinner(f"Installing missing dependencies: {', '.join(missing_packages)}..."):
+                try:
+                    subprocess.check_call(["pip", "install"] + missing_packages)
+                    st.success("Dependencies installed successfully!")
+                except Exception as e:
+                    st.error(f"Error installing dependencies: {e}")
+                    st.error("Try refreshing the page or deploying again.")
+                    return False
+        
+        return True
+    except Exception as e:
+        st.error(f"Error checking dependencies: {e}")
+        return False
 
 # Load models (with caching to avoid reloading)
 @st.cache_resource
@@ -54,72 +78,147 @@ def load_models():
     from diffusers import AutoPipelineForInpainting
     
     with st.spinner("Loading segmentation model..."):
-        model = SamModel.from_pretrained("Zigeng/SlimSAM-uniform-50")
-        processor = SamProcessor.from_pretrained("Zigeng/SlimSAM-uniform-50")
+        try:
+            # Use a smaller, more lightweight SAM model
+            model = SamModel.from_pretrained("Zigeng/SlimSAM-uniform-50", 
+                                             low_cpu_mem_usage=True, 
+                                             variant="cpu")
+            processor = SamProcessor.from_pretrained("Zigeng/SlimSAM-uniform-50")
+        except Exception as e:
+            st.error(f"Error loading segmentation model: {e}")
+            st.error("Try refreshing the page or using a different model.")
+            raise e
     
     with st.spinner("Loading inpainting model..."):
-        pipeline = AutoPipelineForInpainting.from_pretrained(
-            "redstonehero/ReV_Animated_Inpainting", 
-            torch_dtype=torch.float16
-        )
-        pipeline.enable_model_cpu_offload()
+        try:
+            # Use a smaller inpainting model with CPU optimization
+            pipeline = AutoPipelineForInpainting.from_pretrained(
+                "runwayml/stable-diffusion-inpainting",  # Using standard SD inpainting model instead of larger one
+                torch_dtype=torch.float32,  # Use float32 for better compatibility
+                use_safetensors=True,
+                variant="fp16",
+                low_cpu_mem_usage=True
+            )
+            # Don't use model_cpu_offload on Streamlit Cloud as it can cause issues
+        except Exception as e:
+            st.error(f"Error loading inpainting model: {e}")
+            st.error("Try refreshing the page or using a different model.")
+            raise e
     
     return model, processor, pipeline
 
 # Generate mask using SAM model
 def generate_mask(img, point):
-    model, processor, _ = load_models()
-    
-    input_points = [[point]]  # Format for processor
-    
-    # Process inputs and get outputs
-    inputs = processor(img, input_points=input_points, return_tensors="pt")
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    # Extract and process masks
-    masks = processor.image_processor.post_process_masks(
-        outputs.pred_masks.cpu(), 
-        inputs["original_sizes"].cpu(), 
-        inputs["reshaped_input_sizes"].cpu()
-    )
-    
-    # Get the best mask
-    if len(masks[0][0]) > 0:
-        # Find the most suitable mask (typically the one with highest prediction score)
-        mask_tensor = masks[0][0][0]  # Default to first mask
-        to_pil = transforms.ToPILImage()
-        binary_matrix = mask_tensor.to(dtype=torch.uint8)
-        mask_pil = to_pil(binary_matrix * 255)
-        return mask_pil
-    
-    return None
+    try:
+        model, processor, _ = load_models()
+        
+        # Display coordinate information
+        st.info(f"Selected point: {point}. For reference, image dimensions are {img.width}x{img.height}")
+        st.info("If the mask doesn't highlight the desired area, try selecting a different point on the garment.")
+        
+        input_points = [[point]]  # Format for processor
+        
+        # Process inputs and get outputs
+        inputs = processor(img, input_points=input_points, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        # Extract and process masks
+        masks = processor.image_processor.post_process_masks(
+            outputs.pred_masks.cpu(), 
+            inputs["original_sizes"].cpu(), 
+            inputs["reshaped_input_sizes"].cpu()
+        )
+        
+        # Get the best mask
+        if len(masks[0][0]) > 0:
+            # Try multiple masks if available
+            mask_idx = 0
+            if len(masks[0][0]) > 1:
+                # Use the second mask if available as it's often better for clothing items
+                mask_idx = 1
+            
+            mask_tensor = masks[0][0][mask_idx]
+            to_pil = transforms.ToPILImage()
+            binary_matrix = mask_tensor.to(dtype=torch.uint8)
+            mask_pil = to_pil(binary_matrix * 255)
+            
+            st.success(f"Found {len(masks[0][0])} potential masks. Using mask #{mask_idx+1}.")
+            return mask_pil
+        
+        st.warning("No mask found. Try selecting a different point on the garment.")
+        return None
+    except Exception as e:
+        st.error(f"Error generating mask: {e}")
+        return None
 
 # Run inpainting with the selected mask
 def run_inpainting(img, mask, prompt):
-    _, _, pipeline = load_models()
+    try:
+        _, _, pipeline = load_models()
+        
+        # Resize to more memory-efficient dimensions
+        target_width = 384  # Smaller size for efficiency
+        target_height = 512
+        img_resized = img.resize((target_width, target_height))
+        mask_resized = mask.resize((target_width, target_height))
+        
+        # Run inpainting with optimized parameters
+        with st.spinner("Generating new design (this might take a while)..."):
+            result = pipeline(
+                prompt=prompt,
+                width=target_width,
+                height=target_height,
+                num_inference_steps=20,  # Reduced steps for speed
+                image=img_resized,
+                mask_image=mask_resized,
+                guidance_scale=7.5,      # Standard guidance scale
+                num_images_per_prompt=1,
+                negative_prompt="low quality, blurry, distorted, deformed",
+            ).images[0]
+        
+        return result
+    except Exception as e:
+        st.error(f"Error during inpainting: {e}")
+        st.error("The model may have run out of memory. Try with a smaller image or a simpler prompt.")
+        return None
+
+# Set page config
+st.set_page_config(
+    page_title="Outfit Customizer", 
+    page_icon="👕",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Add sidebar with instructions
+with st.sidebar:
+    st.title("📋 Instructions")
+    st.markdown("""
+    ### How to use this app:
     
-    # Resize to appropriate dimensions
-    img_resized = img.resize((512, 768))
-    mask_resized = mask.resize((512, 768))
+    1. **Upload an image** of clothing you want to customize
+    2. **Select an area** on the garment you want to modify
+    3. **Enter a design prompt** describing what you want
+    4. **Generate** the new design
     
-    # Run inpainting
-    with st.spinner("Generating new design..."):
-        result = pipeline(
-            prompt=prompt,
-            width=512,
-            height=768,
-            num_inference_steps=30,
-            image=img_resized,
-            mask_image=mask_resized,
-            guidance_scale=3.0,
-            strength=1.0
-        ).images[0]
+    ### Tips for good results:
     
-    return result
+    - Use clear images with solid backgrounds
+    - Select points in the center of the garment area
+    - Use descriptive prompts like "floral pattern" or "plaid design"
+    - If results aren't good, try selecting a different point
+    
+    ### About:
+    
+    This app uses AI segmentation and diffusion models to customize clothing items in images.
+    """)
+    
+    st.markdown("---")
+    st.caption("⚠️ This app runs in the browser and may take some time to load and process images.")
 
 # Main app flow
-if install_dependencies():
+if check_dependencies():
     # Step 1: Upload image
     if st.session_state['stage'] == "upload":
         uploaded_file = st.file_uploader("Choose an image of clothing to customize", type=["jpg", "jpeg", "png"])
@@ -132,32 +231,69 @@ if install_dependencies():
     
     # Step 2: Select area to modify
     elif st.session_state['stage'] == "select_area":
-        st.write("Click on the part of the outfit you want to modify (e.g., shirt, pants)")
+        st.write("Select the part of the outfit you want to modify (e.g., shirt, pants)")
         
-        # Create a matplotlib figure for the interactive image
-        fig = Figure(figsize=(10, 10))
-        ax = fig.add_subplot(111)
-        ax.imshow(st.session_state['img'])
-        ax.axis('on')
+        # Create a container for the image display
+        image_container = st.container()
         
-        # Display the image with onClick functionality
-        clicked_coords = st.pyplot(fig, use_container_width=True)
+        # Display the image
+        with image_container:
+            st.image(st.session_state['img'], caption="Click a specific part (like shirt or pants)", use_column_width=True)
+            
+        # Add a guide for good selection points
+        st.info("👕 **Selection Guide:**")
+        st.markdown("""
+        - For shirts/tops: Select a point in the middle of the chest area
+        - For pants/bottoms: Select a point in the middle of the thigh area
+        - For sleeves: Select mid-sleeve
+        - Try to click near the center of the item you want to change
+        """)
         
-        # Handle manual coordinate input
+        # Handle coordinate input with examples
+        st.write("### Enter Coordinates")
+        st.write("Enter the X,Y position of the part you want to change:")
+        
         col1, col2, col3 = st.columns(3)
         with col1:
-            x_coord = st.number_input("X coordinate", 0, st.session_state['img'].width, 100)
+            # Default to center of image as starting point
+            default_x = st.session_state['img'].width // 2
+            x_coord = st.number_input("X coordinate", 0, st.session_state['img'].width, default_x)
         with col2:
-            y_coord = st.number_input("Y coordinate", 0, st.session_state['img'].height, 100)
+            default_y = st.session_state['img'].height // 2
+            y_coord = st.number_input("Y coordinate", 0, st.session_state['img'].height, default_y)
         with col3:
-            if st.button("Set Point"):
+            if st.button("Set Point", key="set_point_btn"):
                 st.session_state['points'].append([x_coord, y_coord])
                 st.session_state['last_point'] = [x_coord, y_coord]
+                st.rerun()
+        
+        # Quick selection buttons for common garment areas
+        st.write("### Quick Selection")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("Select Top/Shirt", key="select_top"):
+                # Approximate coordinates for upper body
+                x = st.session_state['img'].width // 2
+                y = st.session_state['img'].height // 3
+                st.session_state['last_point'] = [x, y]
+                st.rerun()
+        with col2:
+            if st.button("Select Bottom/Pants", key="select_bottom"):
+                # Approximate coordinates for lower body
+                x = st.session_state['img'].width // 2
+                y = int(st.session_state['img'].height * 0.7)
+                st.session_state['last_point'] = [x, y]
+                st.rerun()
+        with col3:
+            if st.button("Select Sleeves", key="select_sleeves"):
+                # Approximate coordinates for sleeve
+                x = int(st.session_state['img'].width * 0.25)
+                y = int(st.session_state['img'].height * 0.4)
+                st.session_state['last_point'] = [x, y]
+                st.rerun()
         
         # Show selected points
         if 'last_point' in st.session_state:
-            st.write(f"Selected point: {st.session_state['last_point']}")
-            
             # Generate mask for the selected point
             mask = generate_mask(st.session_state['img'], st.session_state['last_point'])
             if mask:
@@ -173,11 +309,11 @@ if install_dependencies():
                 # Option to proceed or select different area
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("Use this selection"):
+                    if st.button("Use this selection", key="use_selection"):
                         st.session_state['stage'] = "customize"
                         st.rerun()
                 with col2:
-                    if st.button("Select different area"):
+                    if st.button("Select different area", key="diff_selection"):
                         st.session_state['points'] = []
                         if 'last_point' in st.session_state:
                             del st.session_state['last_point']
